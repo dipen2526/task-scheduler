@@ -49,4 +49,10 @@ export const databaseConfig: SequelizeModuleOptions = {
   autoLoadModels: true,
   synchronize: true,
   logging: false,
+  dialectOptions: {
+    ssl: {
+      require: true,
+      rejectUnauthorized: false,
+    },
+  },
 };
