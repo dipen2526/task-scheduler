@@ -1,0 +1,49 @@
+services:
+  api:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: scheduler
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: scheduler-secret
+      AUTH_USERNAME: admin
+      AUTH_PASSWORD: admin123
+    depends_on:
+      - postgres
+      - redis
+
+  worker:
+    build: .
+    command: npm run start:worker
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: scheduler
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      - redis
+      - postgres
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: scheduler
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '5432:5432'
+
+  redis:
+    image: redis
+    ports:
+      - '6379:6379'

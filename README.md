@@ -1,85 +1,161 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Task Scheduler Service
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Distributed scheduled notification/action service with:
+- API service for secure task scheduling and management
+- Worker service for delayed execution and retry handling
+- PostgreSQL persistence for tasks and execution logs
+- Redis + BullMQ for delayed/asynchronous job processing
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://coveralls.io/github/nestjs/nest?branch=master" target="_blank"><img src="https://coveralls.io/repos/github/nestjs/nest/badge.svg?branch=master#9" alt="Coverage" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Architecture Diagram
 
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
-
-```bash
-$ yarn install
+```mermaid
+flowchart LR
+    C[Client] -->|JWT Login| A[API Service]
+    C -->|Schedule/List/Cancel Task| A
+    A -->|Persist Task| P[(PostgreSQL)]
+    A -->|Enqueue Delayed Job| R[(Redis/BullMQ)]
+    W[Worker Service] -->|Consume Ready Job| R
+    W -->|Load/Lock Task| P
+    W -->|HTTP POST to Target URL| X[External Endpoint]
+    W -->|Update Status + Write Logs| P
 ```
 
-## Compile and run the project
+## Service Communication Flow
 
-```bash
-# development
-$ yarn run start
+1. Client authenticates via `POST /auth/login`.
+2. API validates JWT on task endpoints.
+3. `POST /tasks` stores a task in PostgreSQL (`PENDING`) and enqueues a delayed BullMQ job with retries.
+4. Worker consumes job at scheduled time, marks task `RUNNING`, executes external HTTP call, and updates task status.
+5. Worker persists attempt-level execution logs for success/failure and retry metadata.
+6. `DELETE /tasks/:id` cancels pending tasks and removes queued jobs.
 
-# watch mode
-$ yarn run start:dev
+## Database Schema
 
-# production mode
-$ yarn run start:prod
+### `tasks`
+- `id` (UUID, PK)
+- `url` (string, required)
+- `payload` (jsonb, required)
+- `status` (`PENDING|RUNNING|COMPLETED|FAILED|CANCELED`)
+- `scheduledAt` (timestamp, indexed with `status`)
+- `attempts` (int)
+- `maxAttempts` (int)
+- `nextRetryAt` (timestamp, nullable)
+- `executedAt` (timestamp, nullable)
+- `canceledAt` (timestamp, nullable)
+- `lastError` (text, nullable)
+- `createdAt`, `updatedAt`
+
+Indexes:
+- `idx_tasks_status_scheduled_at` on `(status, scheduledAt)` for time-based lookup/filtering.
+
+### `task_execution_logs`
+- `id` (UUID, PK)
+- `taskId` (UUID, indexed with created timestamp)
+- `attempt` (int)
+- `status` (`PENDING|COMPLETED|FAILED`)
+- `httpStatus` (int, nullable)
+- `responseBody` (jsonb, nullable)
+- `error` (text, nullable)
+- `createdAt`
+
+Indexes:
+- `idx_logs_task_id_created_at` on `(taskId, createdAt)`.
+
+## Scheduling and Worker Logic
+
+- Task scheduling:
+  - Validates URL and future `scheduledAt`.
+  - Persists task via service -> repository layer.
+  - Enqueues delayed BullMQ job (`jobId = taskId`) with exponential backoff and max attempts.
+
+- Worker execution:
+  - Fetches and row-locks task in transaction.
+  - Transitions task to `RUNNING` and increments attempt counter atomically.
+  - Executes external HTTP `POST` with payload.
+  - Success: marks `COMPLETED`, writes success log.
+  - Failure: writes error + log, transitions to `PENDING` if retry remains or `FAILED` if exhausted.
+
+## API Endpoints
+
+### Authentication
+- `POST /auth/login`
+  - Body:
+    ```json
+    {
+      "username": "admin",
+      "password": "admin123"
+    }
+    ```
+  - Response:
+    ```json
+    {
+      "accessToken": "<jwt>"
+    }
+    ```
+  - Also sets `access_token` cookie (`HttpOnly`) for local testing.
+
+### Tasks (Auth required)
+- `POST /tasks`
+- `GET /tasks`
+- `GET /tasks/:id`
+- `GET /tasks/:id/logs`
+- `DELETE /tasks/:id`
+
+Auth is accepted via either:
+- `Authorization: Bearer <jwt>`
+- `access_token` cookie set by `/auth/login`
+
+Schedule payload example:
+```json
+{
+  "url": "https://httpbin.org/post",
+  "payload": { "message": "Hello" },
+  "scheduledAt": "2026-03-10T10:00:00.000Z",
+  "maxAttempts": 5
+}
 ```
 
-## Run tests
+## Local Run (Docker)
 
 ```bash
-# unit tests
-$ yarn run test
-
-# e2e tests
-$ yarn run test:e2e
-
-# test coverage
-$ yarn run test:cov
+docker compose up --build
 ```
 
-## Resources
+Services:
+- API: `http://localhost:3000`
+- Worker: background consumer
+- PostgreSQL: `localhost:5432`
+- Redis: `localhost:6379`
 
-Check out a few resources that may come in handy when working with NestJS:
+## Environment Variables
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+| Variable | Default |
+|---|---|
+| `PORT` | `3000` |
+| `DB_HOST` | `postgres` |
+| `DB_PORT` | `5432` |
+| `DB_USER` | `postgres` |
+| `DB_PASSWORD` | `postgres` |
+| `DB_NAME` | `scheduler` |
+| `REDIS_HOST` | `redis` |
+| `REDIS_PORT` | `6379` |
+| `JWT_SECRET` | `scheduler-secret` |
+| `JWT_EXPIRES_IN` | `12h` |
+| `AUTH_USERNAME` | `admin` |
+| `AUTH_PASSWORD` | `admin123` |
 
-## Support
+## Deployment Notes (Render/Fly.io)
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+1. Deploy API and Worker as separate services from the same repo.
+2. Provision managed PostgreSQL and Redis.
+3. Configure shared env vars for both services.
+4. API start command: `npm run start:prod`
+5. Worker start command: `npm run start:worker`
 
-## Stay in touch
+## Scaling Considerations
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+1. Run multiple worker replicas; BullMQ supports competing consumers.
+2. Use PostgreSQL connection pooling and tune worker concurrency.
+3. Add dead-letter queue and alerting for permanently failed tasks.
+4. Partition/archive execution logs for long-term volume growth.
+5. For strict at-least-once guarantees at scale, add idempotency keys on target endpoints.
